@@ -171,3 +171,161 @@
         (ok true)
     )
 )
+
+
+(define-constant BRONZE-TIER u1000000)  ;; 1M STX
+(define-constant SILVER-TIER u5000000)  ;; 5M STX
+(define-constant GOLD-TIER u10000000)   ;; 10M STX
+
+(define-private (get-tier-multiplier (amount uint))
+    (if (>= amount GOLD-TIER)
+        u150    ;; 1.5x rewards
+        (if (>= amount SILVER-TIER)
+            u125  ;; 1.25x rewards
+            (if (>= amount BRONZE-TIER)
+                u110  ;; 1.1x rewards
+                u100
+            )
+        )
+    )
+)
+
+
+
+(define-data-var emergency-mode bool false)
+
+(define-public (emergency-withdraw)
+    (let (
+        (sender tx-sender)
+        (user-deposit (unwrap! (map-get? deposits sender) ERR-NO-DEPOSIT))
+        (deposit-amount (get amount user-deposit))
+    )
+        (asserts! (var-get emergency-mode) ERR-NOT-AUTHORIZED)
+        (try! (as-contract (stx-transfer? deposit-amount (as-contract tx-sender) sender)))
+        (map-delete deposits sender)
+        (ok deposit-amount)
+    )
+)
+(define-public (set-emergency-mode (active bool))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (var-set emergency-mode active)
+        (ok true)
+    )
+)
+
+
+(define-constant COMPOUND-RATE u5) ;; 5% APY
+(define-constant BLOCKS-PER-YEAR u52560)
+
+(define-private (calculate-compound-interest (principal uint) (blocks uint))
+    (let (
+        (rate (/ (* COMPOUND-RATE blocks) BLOCKS-PER-YEAR))
+        (interest (/ (* principal rate) u100))
+    )
+        (+ principal interest)
+    )
+)
+
+
+(define-map staking-levels
+    principal
+    {
+        level: uint,
+        total-staked-blocks: uint
+    }
+)
+
+(define-public (update-staking-level)
+    (let (
+        (user tx-sender)
+        (current-level (default-to {level: u1, total-staked-blocks: u0} 
+                       (map-get? staking-levels user)))
+    )
+        (map-set staking-levels user
+            {
+                level: (+ (get level current-level) u1),
+                total-staked-blocks: (+ (get total-staked-blocks current-level) u1)
+            }
+        )
+        (ok true)
+    )
+)
+
+
+(define-map proposals
+    uint
+    {
+        title: (string-ascii 50),
+        votes-for: uint,
+        votes-against: uint,
+        active: bool
+    }
+)
+
+(define-data-var proposal-count uint u0)
+
+(define-public (create-proposal (title (string-ascii 50)))
+    (let (
+        (id (+ (var-get proposal-count) u1))
+    )
+        (asserts! (>= (get amount (unwrap! (get-deposit-info tx-sender) ERR-NO-DEPOSIT)) MIN-DEPOSIT) ERR-NOT-AUTHORIZED)
+        (map-set proposals id
+            {
+                title: title,
+                votes-for: u0,
+                votes-against: u0,
+                active: true
+            }
+        )
+        (var-set proposal-count id)
+        (ok id)
+    )
+)
+
+
+(define-map time-weights
+    principal
+    {
+        start-block: uint,
+        weight-multiplier: uint
+    }
+)
+
+(define-private (calculate-time-weight (blocks uint))
+    (let (
+        (base-multiplier u100)
+        (bonus-per-block u1)
+    )
+        (+ base-multiplier (* blocks bonus-per-block))
+    )
+)
+
+
+(define-map achievements
+    principal
+    {
+        deposits-count: uint,
+        total-staked: uint,
+        longest-stake: uint
+    }
+)
+
+(define-public (update-achievements)
+    (let (
+        (user tx-sender)
+        (current-achievements (default-to 
+            {deposits-count: u0, total-staked: u0, longest-stake: u0}
+            (map-get? achievements user)))
+    )
+        (map-set achievements user
+            {
+                deposits-count: (+ (get deposits-count current-achievements) u1),
+                total-staked: (+ (get total-staked current-achievements) 
+                             (get amount (unwrap! (get-deposit-info user) ERR-NO-DEPOSIT))),
+                longest-stake: (get locked-until (unwrap! (get-deposit-info user) ERR-NO-DEPOSIT))
+            }
+        )
+        (ok true)
+    )
+)
