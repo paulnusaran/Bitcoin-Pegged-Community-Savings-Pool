@@ -163,6 +163,17 @@
     }
 )
 
+(define-read-only (get-rewards (user principal))
+    (let (
+        (user-deposit (unwrap! (map-get? deposits user) (err u0)))
+        (pool-total (var-get total-pool-balance))
+        (available-rewards (var-get total-rewards))
+        (user-share (/ (* (get amount user-deposit) available-rewards) pool-total))
+    )
+        (ok (- user-share (get rewards-claimed user-deposit)))
+    )
+)
+
 ;; Admin functions
 (define-public (set-pool-active (active bool))
     (begin
@@ -324,6 +335,84 @@
                 total-staked: (+ (get total-staked current-achievements) 
                              (get amount (unwrap! (get-deposit-info user) ERR-NO-DEPOSIT))),
                 longest-stake: (get locked-until (unwrap! (get-deposit-info user) ERR-NO-DEPOSIT))
+            }
+        )
+        (ok true)
+    )
+)
+
+
+(define-map referrals
+    { referrer: principal, referee: principal }
+    { bonus-claimed: bool }
+)
+
+(define-constant REFERRAL-BONUS u5)
+
+(define-public (register-referral (referrer principal))
+    (let (
+        (referee tx-sender)
+    )
+        (asserts! (not (is-eq referee referrer)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-none (get-deposit-info referee)) ERR-NOT-AUTHORIZED)
+        (map-set referrals { referrer: referrer, referee: referee } { bonus-claimed: false })
+        (ok true)
+    )
+)
+
+(define-public (claim-referral-bonus (referee principal))
+    (let (
+        (referrer tx-sender)
+        (referral-data (unwrap! (map-get? referrals { referrer: referrer, referee: referee }) ERR-NOT-AUTHORIZED))
+        (referee-deposit (unwrap! (get-deposit-info referee) ERR-NO-DEPOSIT))
+        (bonus-amount (/ (* (get amount referee-deposit) REFERRAL-BONUS) u100))
+    )
+        (asserts! (not (get bonus-claimed referral-data)) ERR-NOT-AUTHORIZED)
+        (map-set referrals { referrer: referrer, referee: referee } { bonus-claimed: true })
+        (try! (as-contract (stx-transfer? bonus-amount (as-contract tx-sender) referrer)))
+        (ok bonus-amount)
+    )
+)
+
+
+(define-map auto-compound
+    principal
+    { enabled: bool, last-compound: uint }
+)
+
+(define-constant COMPOUND-INTERVAL u144)
+
+(define-public (toggle-auto-compound)
+    (let (
+        (sender tx-sender)
+        (current-setting (default-to { enabled: false, last-compound: u0 } 
+                         (map-get? auto-compound sender)))
+    )
+        (map-set auto-compound sender
+            {
+                enabled: (not (get enabled current-setting)),
+                last-compound: stacks-block-height
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (execute-auto-compound)
+    (let (
+        (sender tx-sender)
+        (compound-settings (unwrap! (map-get? auto-compound sender) ERR-NOT-AUTHORIZED))
+        (user-deposit (unwrap! (get-deposit-info sender) ERR-NO-DEPOSIT))
+        (claimable-rewards (unwrap-panic (get-rewards sender)))
+    )
+        (asserts! (get enabled compound-settings) ERR-NOT-AUTHORIZED)
+        (asserts! (>= (- stacks-block-height (get last-compound compound-settings)) COMPOUND-INTERVAL) ERR-LOCK-PERIOD)
+        (try! (claim-rewards))
+        (try! (deposit claimable-rewards))
+        (map-set auto-compound sender
+            {
+                enabled: true,
+                last-compound: stacks-block-height
             }
         )
         (ok true)
