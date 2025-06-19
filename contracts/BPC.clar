@@ -9,6 +9,17 @@
 (define-constant ERR-LOCK-PERIOD (err u103))
 (define-constant ERR-INVALID-AMOUNT (err u104))
 
+(define-constant BASE-INTEREST-RATE u300)
+(define-constant MAX-INTEREST-RATE u1200)
+(define-constant MIN-INTEREST-RATE u100)
+(define-constant UTILIZATION-THRESHOLD u8000)
+(define-constant RATE-ADJUSTMENT-FACTOR u50)
+
+(define-data-var current-interest-rate uint BASE-INTEREST-RATE)
+(define-data-var last-rate-update uint u0)
+(define-data-var target-pool-size uint u50000000)
+(define-data-var total-withdrawals uint u0)
+
 ;; Pool configuration
 (define-constant LOCK-PERIOD u144)  ;; ~24 hours in blocks
 (define-constant EARLY-EXIT-PENALTY u20)  ;; 20% penalty
@@ -416,5 +427,125 @@
             }
         )
         (ok true)
+    )
+)
+
+(define-private (calculate-utilization-rate)
+    (let (
+        (current-balance (var-get total-pool-balance))
+        (target-size (var-get target-pool-size))
+    )
+        (if (> target-size u0)
+            (/ (* current-balance u10000) target-size)
+            u0
+        )
+    )
+)
+
+(define-private (calculate-new-interest-rate)
+    (let (
+        (utilization (calculate-utilization-rate))
+        (current-rate (var-get current-interest-rate))
+    )
+        (if (> utilization UTILIZATION-THRESHOLD)
+            (let (
+                (increase-factor (/ (* (- utilization UTILIZATION-THRESHOLD) RATE-ADJUSTMENT-FACTOR) u10000))
+                (new-rate (+ current-rate increase-factor))
+            )
+                (if (> new-rate MAX-INTEREST-RATE)
+                    MAX-INTEREST-RATE
+                    new-rate
+                )
+            )
+            (let (
+                (decrease-factor (/ (* (- UTILIZATION-THRESHOLD utilization) RATE-ADJUSTMENT-FACTOR) u10000))
+                (new-rate (- current-rate decrease-factor))
+            )
+                (if (< new-rate MIN-INTEREST-RATE)
+                    MIN-INTEREST-RATE
+                    new-rate
+                )
+            )
+        )
+    )
+)
+
+(define-public (update-interest-rate)
+    (let (
+        (new-rate (calculate-new-interest-rate))
+        (blocks-since-update (- stacks-block-height (var-get last-rate-update)))
+    )
+        (asserts! (>= blocks-since-update u144) ERR-LOCK-PERIOD)
+        (var-set current-interest-rate new-rate)
+        (var-set last-rate-update stacks-block-height)
+        (ok new-rate)
+    )
+)
+
+(define-private (calculate-dynamic-rewards (user-amount uint) (blocks-staked uint))
+    (let (
+        (current-rate (var-get current-interest-rate))
+        (annual-reward (/ (* user-amount current-rate) u10000))
+        (block-reward (/ annual-reward BLOCKS-PER-YEAR))
+        (total-reward (* block-reward blocks-staked))
+    )
+        total-reward
+    )
+)
+
+(define-public (claim-dynamic-rewards)
+    (let (
+        (sender tx-sender)
+        (user-deposit (unwrap! (map-get? deposits sender) ERR-NO-DEPOSIT))
+        (deposit-start (get locked-until user-deposit))
+        (blocks-staked (- stacks-block-height deposit-start))
+        (reward-amount (calculate-dynamic-rewards (get amount user-deposit) blocks-staked))
+    )
+        (asserts! (> blocks-staked LOCK-PERIOD) ERR-LOCK-PERIOD)
+        (asserts! (> reward-amount u0) ERR-INSUFFICIENT-FUNDS)
+        
+        (map-set deposits sender
+            {
+                amount: (get amount user-deposit),
+                locked-until: (get locked-until user-deposit),
+                rewards-claimed: (+ (get rewards-claimed user-deposit) reward-amount)
+            }
+        )
+        
+        (try! (as-contract (stx-transfer? reward-amount (as-contract tx-sender) sender)))
+        (ok reward-amount)
+    )
+)
+
+(define-public (set-target-pool-size (new-target uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (> new-target u0) ERR-INVALID-AMOUNT)
+        (var-set target-pool-size new-target)
+        (ok true)
+    )
+)
+
+(define-read-only (get-current-interest-rate)
+    (var-get current-interest-rate)
+)
+
+(define-read-only (get-utilization-stats)
+    {
+        utilization-rate: (calculate-utilization-rate),
+        current-interest-rate: (var-get current-interest-rate),
+        target-pool-size: (var-get target-pool-size),
+        current-pool-balance: (var-get total-pool-balance)
+    }
+)
+
+(define-read-only (preview-dynamic-rewards (user principal))
+    (let (
+        (user-deposit (unwrap! (map-get? deposits user) (err u0)))
+        (deposit-start (get locked-until user-deposit))
+        (blocks-staked (- stacks-block-height deposit-start))
+        (estimated-reward (calculate-dynamic-rewards (get amount user-deposit) blocks-staked))
+    )
+        (ok estimated-reward)
     )
 )
