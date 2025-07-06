@@ -549,3 +549,175 @@
         (ok estimated-reward)
     )
 )
+
+(define-constant INSURANCE-PREMIUM-RATE u25)
+(define-constant MAX-COVERAGE-RATIO u8000)
+(define-constant CLAIM-PROCESSING-PERIOD u1008)
+(define-constant ERR-CLAIM-EXISTS (err u200))
+(define-constant ERR-INSUFFICIENT-COVERAGE (err u201))
+(define-constant ERR-CLAIM-PENDING (err u202))
+
+(define-data-var insurance-fund-balance uint u0)
+(define-data-var total-coverage-amount uint u0)
+(define-data-var claim-counter uint u0)
+
+(define-map insurance-coverage
+    principal
+    {
+        coverage-amount: uint,
+        premium-paid: uint,
+        active: bool
+    }
+)
+
+(define-map insurance-claims
+    uint
+    {
+        claimant: principal,
+        claim-amount: uint,
+        submitted-at: uint,
+        status: (string-ascii 20),
+        processed-at: uint
+    }
+)
+
+(define-private (calculate-insurance-premium (deposit-amount uint))
+    (/ (* deposit-amount INSURANCE-PREMIUM-RATE) u10000)
+)
+
+(define-private (calculate-coverage-amount (deposit-amount uint))
+    (let (
+        (max-coverage (/ (* deposit-amount MAX-COVERAGE-RATIO) u10000))
+        (fund-balance (var-get insurance-fund-balance))
+        (total-coverage (var-get total-coverage-amount))
+        (available-coverage (- fund-balance total-coverage))
+    )
+        (if (> max-coverage available-coverage)
+            available-coverage
+            max-coverage
+        )
+    )
+)
+
+(define-public (purchase-insurance-coverage (deposit-amount uint))
+    (let (
+        (user tx-sender)
+        (premium-amount (calculate-insurance-premium deposit-amount))
+        (coverage-amount (calculate-coverage-amount deposit-amount))
+        (existing-coverage (map-get? insurance-coverage user))
+    )
+        (asserts! (is-some (get-deposit-info user)) ERR-NO-DEPOSIT)
+        (asserts! (> coverage-amount u0) ERR-INSUFFICIENT-COVERAGE)
+        
+        (try! (stx-transfer? premium-amount user (as-contract tx-sender)))
+        
+        (map-set insurance-coverage user
+            {
+                coverage-amount: coverage-amount,
+                premium-paid: premium-amount,
+                active: true
+            }
+        )
+        
+        (var-set insurance-fund-balance (+ (var-get insurance-fund-balance) premium-amount))
+        (var-set total-coverage-amount (+ (var-get total-coverage-amount) coverage-amount))
+        (ok coverage-amount)
+    )
+)
+
+(define-public (submit-insurance-claim (claim-amount uint) (reason (string-ascii 100)))
+    (let (
+        (user tx-sender)
+        (user-coverage (unwrap! (map-get? insurance-coverage user) ERR-NOT-AUTHORIZED))
+        (claim-id (+ (var-get claim-counter) u1))
+        (coverage-amount (get coverage-amount user-coverage))
+    )
+        (asserts! (get active user-coverage) ERR-NOT-AUTHORIZED)
+        (asserts! (<= claim-amount coverage-amount) ERR-INSUFFICIENT-COVERAGE)
+        
+        (map-set insurance-claims claim-id
+            {
+                claimant: user,
+                claim-amount: claim-amount,
+                submitted-at: stacks-block-height,
+                status: "pending",
+                processed-at: u0
+            }
+        )
+        
+        (var-set claim-counter claim-id)
+        (ok claim-id)
+    )
+)
+
+(define-public (process-insurance-claim (claim-id uint) (approve bool))
+    (let (
+        (claim-data (unwrap! (map-get? insurance-claims claim-id) ERR-NOT-AUTHORIZED))
+        (claimant (get claimant claim-data))
+        (claim-amount (get claim-amount claim-data))
+        (fund-balance (var-get insurance-fund-balance))
+    )
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status claim-data) "pending") ERR-CLAIM-PENDING)
+        
+        (if approve
+            (begin
+                (asserts! (>= fund-balance claim-amount) ERR-INSUFFICIENT-FUNDS)
+                (try! (as-contract (stx-transfer? claim-amount (as-contract tx-sender) claimant)))
+                (var-set insurance-fund-balance (- fund-balance claim-amount))
+                (map-set insurance-claims claim-id
+                    {
+                        claimant: claimant,
+                        claim-amount: claim-amount,
+                        submitted-at: (get submitted-at claim-data),
+                        status: "approved",
+                        processed-at: stacks-block-height
+                    }
+                )
+                (map-set insurance-coverage claimant
+                    {
+                        coverage-amount: u0,
+                        premium-paid: (get premium-paid (unwrap-panic (map-get? insurance-coverage claimant))),
+                        active: false
+                    }
+                )
+                (ok true)
+            )
+            (begin
+                (map-set insurance-claims claim-id
+                    {
+                        claimant: claimant,
+                        claim-amount: claim-amount,
+                        submitted-at: (get submitted-at claim-data),
+                        status: "rejected",
+                        processed-at: stacks-block-height
+                    }
+                )
+                (ok false)
+            )
+        )
+    )
+)
+
+(define-read-only (get-insurance-coverage (user principal))
+    (map-get? insurance-coverage user)
+)
+
+(define-read-only (get-insurance-fund-stats)
+    {
+        fund-balance: (var-get insurance-fund-balance),
+        total-coverage: (var-get total-coverage-amount),
+        available-coverage: (- (var-get insurance-fund-balance) (var-get total-coverage-amount))
+    }
+)
+
+(define-read-only (get-claim-info (claim-id uint))
+    (map-get? insurance-claims claim-id)
+)
+
+(define-read-only (preview-insurance-cost (deposit-amount uint))
+    {
+        premium-cost: (calculate-insurance-premium deposit-amount),
+        coverage-amount: (calculate-coverage-amount deposit-amount)
+    }
+)
