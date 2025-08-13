@@ -715,9 +715,268 @@
     (map-get? insurance-claims claim-id)
 )
 
+;; Bitcoin Peg Stability Engine Constants
+(define-constant BTC-PEG-TARGET u100000000) ;; 1 BTC in satoshis  
+(define-constant PEG-TOLERANCE u500) ;; 5% tolerance
+(define-constant STABILITY-REWARD-RATE u150) ;; 1.5% bonus for stabilizers
+(define-constant REBALANCE-THRESHOLD u1000) ;; 10% deviation triggers rebalancing
+(define-constant ORACLE-UPDATE-INTERVAL u144) ;; Update every ~24 hours
+(define-constant MAX-STABILITY-BONUS u5000000) ;; Max 5 STX stability bonus
+
+;; Peg stability error codes
+(define-constant ERR-PEG-OUT-OF-RANGE (err u300))
+(define-constant ERR-ORACLE-STALE (err u301))
+(define-constant ERR-INSUFFICIENT-STABILITY-FUND (err u302))
+(define-constant ERR-REBALANCE-NOT-NEEDED (err u303))
+
+;; Bitcoin price oracle and peg tracking
+(define-data-var btc-price-usd uint u45000000000) ;; $45,000 in micro-USD
+(define-data-var stx-price-usd uint u1500000) ;; $1.50 in micro-USD
+(define-data-var last-oracle-update uint u0)
+(define-data-var current-peg-ratio uint u100000000) ;; 1:1 ratio in basis points
+(define-data-var target-peg-ratio uint u100000000)
+(define-data-var stability-fund-balance uint u0)
+(define-data-var total-rebalance-events uint u0)
+
+;; Peg stability tracking maps
+(define-map peg-stabilizers
+    principal
+    {
+        total-stabilized: uint,
+        rewards-earned: uint,
+        last-action: uint
+    }
+)
+
+(define-map rebalance-history
+    uint
+    {
+        timestamp: uint,
+        old-ratio: uint,
+        new-ratio: uint,
+        adjustment-amount: uint,
+        stabilizer: principal
+    }
+)
+
+;; Private functions for peg calculations
+(define-private (calculate-current-peg-ratio)
+    (let (
+        (btc-price (var-get btc-price-usd))
+        (stx-price (var-get stx-price-usd))
+        (pool-value-usd (/ (* (var-get total-pool-balance) stx-price) u1000000))
+        (btc-equivalent (/ pool-value-usd btc-price))
+    )
+        ;; Return ratio as basis points (10000 = 1:1)
+        (if (> btc-equivalent u0)
+            (/ (* BTC-PEG-TARGET u10000) btc-equivalent)
+            u0
+        )
+    )
+)
+
+(define-private (is-peg-stable)
+    (let (
+        (current-ratio (calculate-current-peg-ratio))
+        (target-ratio (var-get target-peg-ratio))
+        (deviation (if (> current-ratio target-ratio)
+                      (- current-ratio target-ratio)
+                      (- target-ratio current-ratio)))
+        (deviation-percentage (/ (* deviation u10000) target-ratio))
+    )
+        (<= deviation-percentage PEG-TOLERANCE)
+    )
+)
+
+(define-private (calculate-stability-adjustment (user-amount uint))
+    (let (
+        (current-ratio (calculate-current-peg-ratio))
+        (target-ratio (var-get target-peg-ratio))
+        (deviation (if (> current-ratio target-ratio)
+                      (- current-ratio target-ratio)
+                      (- target-ratio current-ratio)))
+        (adjustment-factor (/ (* deviation STABILITY-REWARD-RATE) u10000))
+        (adjustment-amount (/ (* user-amount adjustment-factor) u10000))
+    )
+        (if (> adjustment-amount MAX-STABILITY-BONUS)
+            MAX-STABILITY-BONUS
+            adjustment-amount
+        )
+    )
+)
+
+(define-private (needs-rebalancing)
+    (let (
+        (current-ratio (calculate-current-peg-ratio))
+        (target-ratio (var-get target-peg-ratio))
+        (deviation (if (> current-ratio target-ratio)
+                      (- current-ratio target-ratio)
+                      (- target-ratio current-ratio)))
+        (deviation-percentage (/ (* deviation u10000) target-ratio))
+    )
+        (>= deviation-percentage REBALANCE-THRESHOLD)
+    )
+)
+
+;; Oracle update function (simulated price feed)
+(define-public (update-btc-oracle (new-btc-price uint) (new-stx-price uint))
+    (let (
+        (time-since-update (- stacks-block-height (var-get last-oracle-update)))
+    )
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (>= time-since-update ORACLE-UPDATE-INTERVAL) ERR-ORACLE-STALE)
+        (asserts! (> new-btc-price u0) ERR-INVALID-AMOUNT)
+        (asserts! (> new-stx-price u0) ERR-INVALID-AMOUNT)
+        
+        (var-set btc-price-usd new-btc-price)
+        (var-set stx-price-usd new-stx-price)
+        (var-set last-oracle-update stacks-block-height)
+        (var-set current-peg-ratio (calculate-current-peg-ratio))
+        (ok true)
+    )
+)
+
+;; Stability action for users to help maintain peg
+(define-public (perform-stability-action (action-type (string-ascii 20)))
+    (let (
+        (user tx-sender)
+        (user-deposit (unwrap! (get-deposit-info user) ERR-NO-DEPOSIT))
+        (deposit-amount (get amount user-deposit))
+        (stability-bonus (calculate-stability-adjustment deposit-amount))
+        (current-stabilizer (default-to 
+            {total-stabilized: u0, rewards-earned: u0, last-action: u0}
+            (map-get? peg-stabilizers user)))
+    )
+        (asserts! (not (is-peg-stable)) ERR-PEG-OUT-OF-RANGE)
+        (asserts! (>= (var-get stability-fund-balance) stability-bonus) ERR-INSUFFICIENT-STABILITY-FUND)
+        
+        ;; Update stabilizer record
+        (map-set peg-stabilizers user
+            {
+                total-stabilized: (+ (get total-stabilized current-stabilizer) deposit-amount),
+                rewards-earned: (+ (get rewards-earned current-stabilizer) stability-bonus),
+                last-action: stacks-block-height
+            }
+        )
+        
+        ;; Pay stability bonus
+        (var-set stability-fund-balance (- (var-get stability-fund-balance) stability-bonus))
+        (try! (as-contract (stx-transfer? stability-bonus (as-contract tx-sender) user)))
+        (ok stability-bonus)
+    )
+)
+
+;; Automated rebalancing mechanism
+(define-public (trigger-rebalance)
+    (let (
+        (user tx-sender)
+        (current-ratio (calculate-current-peg-ratio))
+        (target-ratio (var-get target-peg-ratio))
+        (rebalance-id (+ (var-get total-rebalance-events) u1))
+        (adjustment-amount (calculate-stability-adjustment (var-get total-pool-balance)))
+    )
+        (asserts! (needs-rebalancing) ERR-REBALANCE-NOT-NEEDED)
+        (asserts! (is-some (get-deposit-info user)) ERR-NO-DEPOSIT)
+        
+        ;; Record rebalance event
+        (map-set rebalance-history rebalance-id
+            {
+                timestamp: stacks-block-height,
+                old-ratio: current-ratio,
+                new-ratio: target-ratio,
+                adjustment-amount: adjustment-amount,
+                stabilizer: user
+            }
+        )
+        
+        ;; Update ratios and counters
+        (var-set current-peg-ratio target-ratio)
+        (var-set total-rebalance-events rebalance-id)
+        
+        ;; Reward the rebalancer
+        (let (
+            (rebalance-reward (/ adjustment-amount u10))
+            (current-stabilizer (default-to 
+                {total-stabilized: u0, rewards-earned: u0, last-action: u0}
+                (map-get? peg-stabilizers user)))
+        )
+            (map-set peg-stabilizers user
+                {
+                    total-stabilized: (get total-stabilized current-stabilizer),
+                    rewards-earned: (+ (get rewards-earned current-stabilizer) rebalance-reward),
+                    last-action: stacks-block-height
+                }
+            )
+            (try! (as-contract (stx-transfer? rebalance-reward (as-contract tx-sender) user)))
+        )
+        (ok rebalance-id)
+    )
+)
+
+;; Fund the stability mechanism
+(define-public (fund-stability-pool (amount uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (var-set stability-fund-balance (+ (var-get stability-fund-balance) amount))
+        (ok true)
+    )
+)
+
+;; Set new target peg ratio
+(define-public (set-target-peg-ratio (new-ratio uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (> new-ratio u0) ERR-INVALID-AMOUNT)
+        (var-set target-peg-ratio new-ratio)
+        (ok true)
+    )
+)
+
+;; Read-only functions for peg monitoring
+(define-read-only (get-peg-status)
+    {
+        current-ratio: (var-get current-peg-ratio),
+        target-ratio: (var-get target-peg-ratio),
+        is-stable: (is-peg-stable),
+        needs-rebalance: (needs-rebalancing),
+        btc-price: (var-get btc-price-usd),
+        stx-price: (var-get stx-price-usd),
+        last-oracle-update: (var-get last-oracle-update)
+    }
+)
+
+(define-read-only (get-stability-fund-info)
+    {
+        fund-balance: (var-get stability-fund-balance),
+        total-rebalance-events: (var-get total-rebalance-events)
+    }
+)
+
+(define-read-only (get-stabilizer-info (user principal))
+    (map-get? peg-stabilizers user)
+)
+
+(define-read-only (get-rebalance-history (event-id uint))
+    (map-get? rebalance-history event-id)
+)
+
+(define-read-only (preview-stability-reward (user principal))
+    (let (
+        (user-deposit (unwrap! (get-deposit-info user) (err u0)))
+        (deposit-amount (get amount user-deposit))
+        (potential-bonus (calculate-stability-adjustment deposit-amount))
+    )
+        (ok potential-bonus)
+    )
+)
+
 (define-read-only (preview-insurance-cost (deposit-amount uint))
     {
         premium-cost: (calculate-insurance-premium deposit-amount),
         coverage-amount: (calculate-coverage-amount deposit-amount)
     }
 )
+
+
+
