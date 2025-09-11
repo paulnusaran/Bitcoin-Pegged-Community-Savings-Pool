@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/BPC.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.LiquidityMining]
+path = 'contracts/LiquidityMining.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
